@@ -1,18 +1,5 @@
 package main
 
-import (
-	"archive/zip"
-	"fmt"
-	"io"
-	"log"
-	"os"
-	"path/filepath"
-	"strconv"
-	"time"
-
-	"github.com/urfave/cli"
-)
-
 // Boar is a simple CLI that creates a web server that serves static files or directories. When a directory is specified, Boar will serve a list with the files to download each individually or as a zip file. When a file is specified, Boar will serve the file for download. at /<file> or a simple UI to download the file at /.
 
 // Boar uses the following command line arguments:
@@ -25,6 +12,31 @@ import (
 // Boar uses the following environment variables:
 // BOAR_PORT: The port to listen on. Default is 8080.
 // BOAR_NOZIP: Disable the zip download feature. Default is false.
+
+import (
+	"archive/zip"
+	_ "embed"
+	"fmt"
+	"html/template"
+	"io"
+	"log"
+	"net/http"
+	"os"
+	"path/filepath"
+	"strconv"
+	"time"
+
+	"github.com/urfave/cli/v2"
+)
+
+//go:embed templates/dir.html
+var dirTemplate string
+
+//go:embed templates/file.html
+var fileTemplate string
+
+// define the dir struct
+// define the file struct defining file dir, name and size
 
 type File struct {
 	Path string
@@ -130,14 +142,167 @@ func zipFolder(folder string) string {
 
 }
 
+func getArgType(dir string) string {
+	// check if the dir is a file or a directory
+	inf, err := os.Stat(dir)
+
+	if err != nil {
+		log.Fatal(err)
+	}
+	if inf.IsDir() {
+		return "dir"
+	} else {
+		return "file"
+	}
+}
+
+func renderDirHTML(writer http.ResponseWriter, folder Dir, zipPath string, zipName string) {
+	// render the directory template
+
+	fld := Dir{
+		DirName: folder.DirName,
+		DirPath: folder.DirPath,
+		Files:   folder.Files,
+		ZipPath: zipPath,
+		ZipName: zipName,
+	}
+
+	log.Println("Rendering ", fld.DirName, " at ", fld.DirPath)
+	log.Println(fld)
+
+	tmpl, err := template.New("dir").Parse(dirTemplate)
+	if err != nil {
+		log.Fatal(err)
+	}
+	err = tmpl.Execute(writer, fld)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+}
+
+func renderFileHTML(writer http.ResponseWriter, file File) {
+
+	f := File{
+		Path: file.Path,
+		Name: file.Name,
+		Size: file.Size,
+	}
+
+	log.Println("Rendering ", f.Name, " at ", f.Path)
+	log.Println(f)
+
+	tmpl, err := template.New("file").Parse(fileTemplate)
+	if err != nil {
+		log.Fatal(err)
+	}
+	err = tmpl.Execute(writer, f)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+}
+
 func run(c *cli.Context) error {
-	port := c.Int("port")
-	nozip := c.Bool("nozip")
-	children := c.Bool("children")
+	fmt.Println("Boar is running...")
+	arg := c.Args().Get(0)
 
-	log.Printf("Starting Boar on port %d", port)
+	target, err := filepath.Abs(arg)
+	if err != nil {
+		log.Fatal(err)
+	}
 
+	if arg == "" {
+		log.Fatal("No directory nor file provided.")
+	}
+	argtype := getArgType(target)
+	log.Println("The argument is a ", argtype)
+	if argtype == "dir" {
+		zipPath := zipFolder(target)
+		log.Println("The zip path is ", zipPath)
+
+		dirToServe := Dir{
+			DirName: filepath.Base(target),
+			DirPath: target,
+			ZipPath: zipPath,
+			ZipName: filepath.Base(zipPath),
+			Files:   retrieveFiles(target),
+		}
+		webServer(dirToServe, c.String("port"), argtype, zipPath, File{})
+
+	} else if argtype == "file" {
+		file := File{
+			Path: target,
+			Name: filepath.Base(target),
+			Size: 0,
+		}
+		webServer(Dir{}, c.String("port"), argtype, "", file)
+	}
 	return nil
+}
+
+func retrieveFiles(dir string) []File {
+	files, err := os.ReadDir(dir)
+	if err != nil {
+		log.Fatal(err)
+	}
+	var fls []File
+	for _, file := range files {
+
+		i, err := file.Info()
+		if err != nil {
+			log.Fatal(err)
+		}
+
+		f := File{
+			Path: filepath.Join(dir, file.Name()),
+			Name: file.Name(),
+			Size: i.Size(),
+		}
+		fls = append(fls, f)
+	}
+	return fls
+}
+
+type WebHandler struct {
+	targetType string
+	dirToServe Dir
+	zipPath    string
+	zipName    string
+
+	//File
+	file File
+}
+
+func (wh *WebHandler) HandleRequest(w http.ResponseWriter, r *http.Request) {
+	t := wh.targetType
+	zP := wh.zipPath
+	dTS := wh.dirToServe
+	zN := wh.zipName
+
+	fF := wh.file
+
+	if t == "dir" {
+		renderDirHTML(w, dTS, zP, zN)
+	} else {
+		renderFileHTML(w, fF)
+	}
+}
+
+func webServer(dirToServe Dir, port string, argtype string, zipPath string, file File) {
+	log.Println("Serving ", dirToServe.DirName, " at ", dirToServe.DirPath)
+	wh := WebHandler{
+		targetType: argtype,
+		dirToServe: dirToServe,
+		zipPath:    zipPath,
+		zipName:    filepath.Base(zipPath),
+		file:       file,
+	}
+	http.Handle("/", http.HandlerFunc(wh.HandleRequest))
+	err := http.ListenAndServe(":"+port, nil)
+	if err != nil {
+		log.Fatal(err)
+	}
 }
 
 func main() {
